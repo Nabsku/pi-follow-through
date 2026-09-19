@@ -1,0 +1,30 @@
+{
+  "name": "pi-follow-through",
+  "version": "0.1.0",
+  "description": "A Pi extension that asks Jev whether useful work remains after a run.",
+  "keywords": ["pi-package", "pi", "jev", "typesafe"],
+  "license": "MIT",
+  "author": "Nabsku",
+  "type": "module",
+  "files": ["extensions", "docs", "LICENSE", "README.md", "CONTRIBUTING.md"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Nabsku/pi-follow-through.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Nabsku/pi-follow-through/issues"
+  },
+  "homepage": "https://github.com/Nabsku/pi-follow-through#readme",
+  "scripts": {
+    "test": "tsx --test"
+  },
+  "pi": {
+    "extensions": ["./extensions/follow-through.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "tsx": "^4.23.1"
+  }
+}
