@@ -7,7 +7,7 @@ After a run settles, it sends the recent request, tool calls, transcript, and fi
 ## Install
 
 ```sh
-pi install git:github.com/Nabsku/pi-follow-through
+pi install npm:pi-follow-through
 ```
 
 Review the source before installing it. Pi extensions run with the permissions of the Pi process.
@@ -40,7 +40,7 @@ Put this in `~/.pi/agent/settings.json` for all projects or in
 
 ## What it does
 
-The extension runs after `agent_settled`, not after every model call or tool call. It asks Jev one typed yes/no question. At a probability of `0.80` or higher, it sends this message:
+The extension runs after `agent_settled`, not after every model call or tool call. It asks Jev one typed yes/no question. At the configured threshold (default `0.80`) or higher, it sends this message:
 
 ```text
 Continue useful work that is still within the user's request. Check for unfinished requested work and complete it now; do not invent follow-up work. If the request is complete, or progress needs user input, permission, or an external event, stop and say so.
