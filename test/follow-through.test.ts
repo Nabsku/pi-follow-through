@@ -43,11 +43,18 @@ type SettingsFixture = {
 	};
 };
 
+type StateCandidate = {
+	id: string;
+	text: string;
+};
+
 type RequestState = {
 	task: string;
 	recent_transcript: string;
 	final_output: string;
 	previous_nudge: string | null;
+	request_candidates: StateCandidate[];
+	evidence_candidates: StateCandidate[];
 	tool_calls?: string;
 };
 
@@ -141,6 +148,24 @@ async function withEnv(values: Record<string, string | undefined>, fn: () => Pro
 	}
 }
 
+function jevResponse(
+	state: RequestState,
+	workStatus: "complete" | "incomplete" | "blocked" | "unknown" = "incomplete",
+	probability = 0.9,
+): Response {
+	return new Response(
+		JSON.stringify({
+			answers: {
+				should_nudge: { noul: probability },
+				request_evidence: { choice: state.request_candidates[0]?.id ?? "none" },
+				unfinished_evidence: { choice: state.evidence_candidates[0]?.id ?? "none" },
+				work_status: { choice: workStatus },
+			},
+		}),
+		{ status: 200 },
+	);
+}
+
 test("does not call TypeSafe or nudge without an API key", async () => {
 	const agentDir = await mkdtemp(join(tmpdir(), "pi-follow-through-"));
 	const originalFetch = globalThis.fetch;
@@ -200,11 +225,10 @@ test("uses trusted project settings and omits tool data when configured", async 
 	const requests: RequestBody[] = [];
 	globalThis.fetch = async (_input, init) => {
 		// SAFETY: the extension under test serializes a request with this exact body shape.
-		requests.push(JSON.parse(String(init?.body)) as RequestBody);
+		const request = JSON.parse(String(init?.body)) as RequestBody;
+		requests.push(request);
 
-		return new Response(JSON.stringify({ answers: { should_nudge: { noul: 0.9 } } }), {
-			status: 200,
-		});
+		return jevResponse(request.state);
 	};
 
 	try {
@@ -213,7 +237,7 @@ test("uses trusted project settings and omits tool data when configured", async 
 			async () => {
 				const pi = createPi();
 				install(pi);
-				await settle(pi, createContext(projectDir, branch));
+				await settle(pi, createContext(projectDir, branch), "Implementation remains incomplete.");
 				assert.equal(requests.length, 1);
 				assert.deepEqual(pi.sentMessages, []);
 
@@ -231,5 +255,124 @@ test("uses trusted project settings and omits tool data when configured", async 
 			rm(agentDir, { recursive: true, force: true }),
 			rm(projectDir, { recursive: true, force: true }),
 		]);
+	}
+});
+
+test("nudges only when Jev cites current request evidence", async () => {
+	const agentDir = await mkdtemp(join(tmpdir(), "pi-follow-through-"));
+
+	const branch: TestEntry[] = [
+		{ type: "message", message: { role: "user", content: "Finish the implementation." } },
+	];
+
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (_input, init) => {
+		// SAFETY: The extension under test serializes this request with the RequestBody shape.
+		const request = JSON.parse(String(init?.body)) as RequestBody;
+
+		return jevResponse(request.state);
+	};
+
+	try {
+		await withEnv(
+			{ PI_CODING_AGENT_DIR: agentDir, TYPESAFE_API_KEY: "test-key", TYPESAFE_AI_API_KEY: undefined },
+			async () => {
+				const pi = createPi();
+				install(pi);
+				await settle(
+					pi,
+					createContext(agentDir, branch),
+					"The implementation remains incomplete; I can finish it now.",
+				);
+				await emit(pi, "agent_start", {});
+				await emit(pi, "agent_end", {
+					messages: [{ role: "assistant", content: "The implementation remains incomplete; I can finish it now." }],
+				});
+				await emit(pi, "agent_settled", {}, createContext(agentDir, branch));
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				assert.equal(pi.sentMessages.length, 1);
+			},
+		);
+	} finally {
+		globalThis.fetch = originalFetch;
+		await rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("rejects a completion status even with a high Jev probability", async () => {
+	const agentDir = await mkdtemp(join(tmpdir(), "pi-follow-through-"));
+
+	const branch: TestEntry[] = [
+		{ type: "message", message: { role: "user", content: "Finish the implementation." } },
+	];
+
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (_input, init) => {
+		// SAFETY: The extension under test serializes this request with the RequestBody shape.
+		const request = JSON.parse(String(init?.body)) as RequestBody;
+
+		return jevResponse(request.state, "complete", 1);
+	};
+
+	try {
+		await withEnv(
+			{ PI_CODING_AGENT_DIR: agentDir, TYPESAFE_API_KEY: "test-key", TYPESAFE_AI_API_KEY: undefined },
+			async () => {
+				const pi = createPi();
+				install(pi);
+				await settle(pi, createContext(agentDir, branch), "The implementation is complete.");
+				assert.deepEqual(pi.sentMessages, []);
+			},
+		);
+	} finally {
+		globalThis.fetch = originalFetch;
+		await rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("rejects citations that are not present in the current state", async () => {
+	const agentDir = await mkdtemp(join(tmpdir(), "pi-follow-through-"));
+
+	const branch: TestEntry[] = [
+		{ type: "message", message: { role: "user", content: "Finish the implementation." } },
+	];
+
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (_input, init) => {
+		// SAFETY: The extension under test serializes this request with the RequestBody shape.
+		const request = JSON.parse(String(init?.body)) as RequestBody;
+
+		const response = jevResponse(request.state);
+
+		// SAFETY: The fixture was created by jevResponse and contains the fields below.
+		const body = (await response.json()) as {
+			answers: {
+				request_evidence: { choice: string };
+				unfinished_evidence: { choice: string };
+			};
+		};
+
+		body.answers.request_evidence.choice = "request_missing";
+
+		return new Response(JSON.stringify(body), { status: 200 });
+	};
+
+	try {
+		await withEnv(
+			{ PI_CODING_AGENT_DIR: agentDir, TYPESAFE_API_KEY: "test-key", TYPESAFE_AI_API_KEY: undefined },
+			async () => {
+				const pi = createPi();
+				install(pi);
+				await settle(
+					pi,
+					createContext(agentDir, branch),
+					"The implementation remains incomplete; I can finish it now.",
+				);
+				assert.deepEqual(pi.sentMessages, []);
+			},
+		);
+	} finally {
+		globalThis.fetch = originalFetch;
+		await rm(agentDir, { recursive: true, force: true });
 	}
 });

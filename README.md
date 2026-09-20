@@ -2,7 +2,7 @@
 
 `pi-follow-through` is a Pi extension that checks whether an agent has left useful work unfinished.
 
-After a run settles, it sends the recent request, tool calls, transcript, and final answer to TypeSafe's Jev model. If Jev thinks the agent can make more progress without inventing work or waiting for the user, the extension sends a short continuation prompt.
+After a run settles, it sends the recent request, tool calls, transcript, and final answer to TypeSafe's Jev model. The extension only sends a continuation prompt when Jev identifies a current user request, selects an exact evidence line from the final answer, classifies the work as incomplete, and passes the configured probability threshold. The extension validates every selected ID against the request it sent.
 
 ## Install
 
@@ -40,7 +40,11 @@ Put this in `~/.pi/agent/settings.json` for all projects or in
 
 ## What it does
 
-The extension runs after `agent_settled`, not after every model call or tool call. It asks Jev one typed yes/no question. At the configured threshold (default `0.80`) or higher, it sends this message:
+The extension runs after `agent_settled`, not after every model call or tool call. It asks Jev one probability question and three typed evidence questions: which user request is active, which exact final-output line shows unfinished work, and whether the work is complete, incomplete, blocked, or unknown. The probability must meet the configured threshold (default `0.80`), and the other answers must cite IDs that exist in the submitted state. The extension never parses free-form model output as a citation.
+
+The unfinished-evidence candidates come only from the current final assistant output. This is deliberately conservative: a run that does not explicitly expose unfinished work is not nudged automatically. Identical progress after a previous nudge is also suppressed.
+
+When all gates pass, it sends this message:
 
 ```text
 Continue useful work that is still within the user's request. Check for unfinished requested work and complete it now; do not invent follow-up work. If the request is complete, or progress needs user input, permission, or an external event, stop and say so.

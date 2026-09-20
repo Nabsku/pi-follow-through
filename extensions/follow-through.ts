@@ -19,6 +19,9 @@ const MAX_STATE_CHARS = 24_000;
 
 const MAX_FIELD_CHARS = 8_000;
 
+// TypeSafe Choice supports 255 options; reserve one option for "none".
+const MAX_CHOICE_CANDIDATES = 254;
+
 const NUDGE_MESSAGE =
 	"Continue useful work that is still within the user's request. Check for unfinished requested work and complete it now; do not invent follow-up work. If the request is complete, or progress needs user input, permission, or an external event, stop and say so.";
 
@@ -57,20 +60,42 @@ type FinalRun = {
 	stopReason?: string;
 };
 
+type StateCandidate = {
+	id: string;
+	text: string;
+};
+
+type ChoiceEntry = [string, string];
+
 type JevState = {
 	task: string;
 	recent_transcript: string;
 	final_output: string;
 	previous_nudge: string | null;
+	request_candidates: StateCandidate[];
+	evidence_candidates: StateCandidate[];
 	tool_calls?: string;
 };
 
+type JevNoulAnswer = {
+	noul: number;
+};
+
+type JevChoiceAnswer = {
+	choice: string;
+};
+
 type JevResponse = {
-	answers?: {
-		should_nudge?: {
-			noul?: number;
-		};
+	answers: {
+		should_nudge: JevNoulAnswer;
+		request_evidence: JevChoiceAnswer;
+		unfinished_evidence: JevChoiceAnswer;
+		work_status: JevChoiceAnswer;
 	};
+};
+
+type JevDecision = {
+	probability: number;
 };
 
 function clip(value: string, maxChars: number): string {
@@ -186,6 +211,45 @@ function toolCallsFromMessage(message: AgentMessage): string[] {
 		})
 }
 
+function requestCandidates(lines: string[]): StateCandidate[] {
+	const candidates: StateCandidate[] = [];
+
+	for (const line of lines
+		.filter((value) => value.startsWith("USER:") && !value.includes(NUDGE_MESSAGE))
+		.slice(-8)) {
+		candidates.push({
+			id: `request_${candidates.length}`,
+			text: line.slice("USER: ".length),
+		});
+	}
+
+	return candidates;
+}
+
+function evidenceCandidates(finalOutput: string): StateCandidate[] {
+	const candidates: StateCandidate[] = [];
+
+	for (const line of finalOutput.split(/\r?\n/)) {
+		const text = line.trim();
+
+		if (!text) continue;
+
+		candidates.push({ id: `evidence_${candidates.length}`, text });
+	}
+
+	return candidates.slice(-MAX_CHOICE_CANDIDATES);
+}
+
+function choiceCriteria(candidates: StateCandidate[], noneDescription: string) {
+	const entries: ChoiceEntry[] = [["none", noneDescription]];
+
+	for (const candidate of candidates) {
+		entries.push([candidate.id, candidate.text]);
+	}
+
+	return Object.fromEntries(entries);
+}
+
 function entryText(entry: SessionEntry, includeToolData: boolean): string {
 	if (entry.type !== "message" || !hasContent(entry.message)) return "";
 
@@ -233,17 +297,22 @@ function branchEntries(ctx: ExtensionContext): SessionEntry[] {
 function buildState(ctx: ExtensionContext, finalOutput: string, includeToolData: boolean): JevState {
 	const entries = branchEntries(ctx);
 	const lines = entries.map((entry) => entryText(entry, includeToolData)).filter(Boolean);
-	const requests = lines.filter((line) => line.startsWith("USER:")).slice(-8);
+	const requests = requestCandidates(lines);
 
 	const state: JevState = {
-		task: clip(requests.join("\n\n"), MAX_FIELD_CHARS),
+		task: clip(requests.map((request) => `USER: ${request.text}`).join("\n\n"), MAX_FIELD_CHARS),
 		recent_transcript: clip(lines.slice(-20).join("\n\n"), MAX_STATE_CHARS),
 		final_output: clip(finalOutput, MAX_FIELD_CHARS),
 		previous_nudge: null,
+		request_candidates: requests,
+		evidence_candidates: evidenceCandidates(finalOutput),
 	};
 
-	const recentNudges = requests.filter((line) => line.includes(NUDGE_MESSAGE));
-	state.previous_nudge = recentNudges.at(-1) ?? null;
+	const recentNudges = lines.filter(
+		(line) => line.startsWith("USER:") && line.includes(NUDGE_MESSAGE),
+	);
+
+	state.previous_nudge = recentNudges.at(-1)?.slice("USER: ".length) ?? null;
 
 	if (includeToolData) {
 		const toolCalls = entries
@@ -263,25 +332,54 @@ function isJevResponse(value: unknown): value is JevResponse {
 
 	const answers = value.answers;
 
-	if (!isJsonObjectValue(answers)) return true;
+	if (!isJsonObjectValue(answers)) return false;
 
 	const shouldNudge = answers.should_nudge;
 
-	if (!isJsonObjectValue(shouldNudge)) return true;
+	if (!isJsonObjectValue(shouldNudge) || !isFiniteNumber(shouldNudge.noul)) return false;
 
-	const probability = shouldNudge.noul;
+	if (shouldNudge.noul < 0 || shouldNudge.noul > 1) return false;
 
-	return (
-		probability === undefined ||
-		(isFiniteNumber(probability) && probability >= 0 && probability <= 1)
-	);
+	for (const key of ["request_evidence", "unfinished_evidence", "work_status"]) {
+		const answer = answers[key];
+
+		if (!isJsonObjectValue(answer) || typeof answer.choice !== "string") return false;
+	}
+
+	return true;
 }
 
-function nudgeProbability(body: JevResponse): number | undefined {
-	return body.answers?.should_nudge?.noul;
+function hasCandidate(candidates: StateCandidate[], id: string): boolean {
+	return candidates.some((candidate) => candidate.id === id);
 }
 
-async function askJev(state: JevState): Promise<number | undefined> {
+function decisionFromResponse(body: JevResponse, state: JevState): JevDecision | undefined {
+	const answers = body.answers;
+	const requestCandidateId = answers.request_evidence.choice;
+	const evidenceCandidateId = answers.unfinished_evidence.choice;
+
+	if (answers.work_status.choice !== "incomplete") return undefined;
+
+	if (requestCandidateId === "none" || evidenceCandidateId === "none") return undefined;
+
+	if (!hasCandidate(state.request_candidates, requestCandidateId)) return undefined;
+
+	if (!hasCandidate(state.evidence_candidates, evidenceCandidateId)) return undefined;
+
+	return {
+		probability: answers.should_nudge.noul,
+	};
+}
+
+function progressFingerprint(state: JevState): string {
+	return JSON.stringify({
+		task: state.task,
+		final_output: state.final_output,
+		tool_calls: state.tool_calls ?? null,
+	});
+}
+
+async function askJev(state: JevState): Promise<JevDecision | undefined> {
 	const apiKey = process.env.TYPESAFE_API_KEY ?? process.env.TYPESAFE_AI_API_KEY;
 
 	if (!apiKey) return undefined;
@@ -310,6 +408,34 @@ async function askJev(state: JevState): Promise<number | undefined> {
 							false: "No useful continuation is available without inventing work or waiting for something outside the agent.",
 						},
 					},
+					request_evidence: {
+						type: "choice",
+						instructions:
+							"Which user request is the unfinished work about? Choose none unless one request is clearly still active and in scope.",
+						criteria: choiceCriteria(
+							state.request_candidates,
+							"No user request is clearly still active and in scope.",
+						),
+					},
+					unfinished_evidence: {
+						type: "choice",
+						instructions:
+							"Which exact line from the final assistant output explicitly shows that requested work remains unfinished and can be advanced now? Choose none if no such line exists.",
+						criteria: choiceCriteria(
+							state.evidence_candidates,
+							"The final assistant output contains no explicit evidence of unfinished, authorized work.",
+						),
+					},
+					work_status: {
+						type: "choice",
+						instructions: "What is the status of the user's requested work in the final assistant output?",
+						criteria: {
+							complete: "The requested work is explicitly complete.",
+							incomplete: "Requested work is explicitly unfinished and can continue now.",
+							blocked: "Progress requires user input, permission, or an external event.",
+							unknown: "The final output does not establish a safe continuation.",
+						},
+					},
 				},
 			}),
 			signal: controller.signal,
@@ -323,7 +449,7 @@ async function askJev(state: JevState): Promise<number | undefined> {
 
 		const body: unknown = await response.json();
 
-		return isJevResponse(body) ? nudgeProbability(body) : undefined;
+		return isJevResponse(body) ? decisionFromResponse(body, state) : undefined;
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		console.warn(`[pi-follow-through] TypeSafe request failed: ${message}`);
@@ -337,10 +463,12 @@ async function askJev(state: JevState): Promise<number | undefined> {
 export default function followThrough(pi: FollowThroughAPI): void {
 	let runNumber = 0;
 	let finalRun: FinalRun | undefined;
+	let lastNudgedProgress: string | undefined;
 
 	pi.on("session_start", () => {
 		runNumber += 1;
 		finalRun = undefined;
+		lastNudgedProgress = undefined;
 	});
 
 	pi.on("agent_start", () => {
@@ -365,16 +493,18 @@ export default function followThrough(pi: FollowThroughAPI): void {
 		const settledRun = runNumber;
 		const config = configFromContext(ctx);
 		const state = buildState(ctx, finalRun.finalOutput, config.includeToolData);
-		void askJev(state).then((probability) => {
+		void askJev(state).then((decision) => {
 			if (
-				probability === undefined ||
-				probability < config.threshold ||
+				decision === undefined ||
+				decision.probability < config.threshold ||
 				settledRun !== runNumber ||
-				!ctx.isIdle()
+				!ctx.isIdle() ||
+				lastNudgedProgress === progressFingerprint(state)
 			) {
 				return;
 			}
 
+			lastNudgedProgress = progressFingerprint(state);
 			pi.sendUserMessage(NUDGE_MESSAGE);
 		}).catch((error) => {
 			console.warn(`[pi-follow-through] Hook failed: ${error instanceof Error ? error.message : String(error)}`);
