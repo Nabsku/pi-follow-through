@@ -1,21 +1,51 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentEndEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
+
 const JEV_MODEL = "jev-latest";
+
 const DEFAULT_THRESHOLD = 0.8;
+
 const DEFAULT_INCLUDE_TOOL_DATA = true;
+
 // Jev is normally fast; an unavailable/slow evaluator must never hold up Pi.
 const REQUEST_TIMEOUT_MS = 2_000;
+
 // Keep the evaluator payload well below Jev's context window; the payload marks truncation explicitly.
 const MAX_STATE_CHARS = 24_000;
+
 const MAX_FIELD_CHARS = 8_000;
+
 const NUDGE_MESSAGE =
 	"Continue useful work that is still within the user's request. Check for unfinished requested work and complete it now; do not invent follow-up work. If the request is complete, or progress needs user input, permission, or an external event, stop and say so.";
 
-type UnknownRecord = Record<string, unknown>;
+type AgentMessage = AgentEndEvent["messages"][number];
+
+type SessionEntry = ReturnType<ExtensionContext["sessionManager"]["getBranch"]>[number];
+
+type FollowThroughAPI = Pick<ExtensionAPI, "on" | "sendUserMessage">;
+
+type ContentMessage = Extract<AgentMessage, { role: "user" | "assistant" | "toolResult" | "custom" }>;
+
+type JsonPrimitive = string | number | boolean | null;
+
+type JsonValue = JsonPrimitive | JsonValue[] | JsonObject;
+
+type JsonObject = {
+	readonly [key: string]: JsonValue;
+};
+
+type FollowThroughSettings = {
+	threshold?: number;
+	includeToolData?: boolean;
+};
+
+type SettingsFile = {
+	followThrough?: FollowThroughSettings;
+};
 
 type FollowThroughConfig = {
 	threshold: number;
@@ -27,61 +57,95 @@ type FinalRun = {
 	stopReason?: string;
 };
 
+type JevState = {
+	task: string;
+	recent_transcript: string;
+	final_output: string;
+	previous_nudge: string | null;
+	tool_calls?: string;
+};
+
+type JevResponse = {
+	answers?: {
+		should_nudge?: {
+			noul?: number;
+		};
+	};
+};
+
 function clip(value: string, maxChars: number): string {
 	return value.length <= maxChars ? value : `${value.slice(0, maxChars)}\n[truncated]`;
 }
 
-function textFromContent(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-
-	return content
-		.map((part) => {
-			if (!part || typeof part !== "object") return "";
-			const value = part as UnknownRecord;
-			return typeof value.text === "string" ? value.text : "";
-		})
-		.filter(Boolean)
-		.join("\n");
+function isJsonObject(value: unknown): value is JsonObject {
+	return (
+		value !== null &&
+		typeof value === "object" &&
+		!Array.isArray(value) &&
+		Object.values(value).every(isJsonValue)
+	);
 }
 
-function isRecord(value: unknown): value is UnknownRecord {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
+function isJsonValue(value: unknown): value is JsonValue {
+	if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+		return true;
+	}
+
+	return Array.isArray(value) ? value.every(isJsonValue) : isJsonObject(value);
 }
 
-function readSettings(path: string): UnknownRecord {
+function isJsonObjectValue(value: JsonValue | undefined): value is JsonObject {
+	return value !== undefined && typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isBoolean(value: JsonValue | undefined): value is boolean {
+	return typeof value === "boolean";
+}
+
+function isFiniteNumber(value: JsonValue | undefined): value is number {
+	return typeof value === "number" && Number.isFinite(value);
+}
+
+function parseSettings(value: JsonValue): SettingsFile {
+	if (!isJsonObjectValue(value)) return {};
+
+	const rawFollowThrough = value.followThrough;
+
+	if (!isJsonObjectValue(rawFollowThrough)) return {};
+
+	const followThrough: FollowThroughSettings = {};
+
+	if (
+		isFiniteNumber(rawFollowThrough.threshold) &&
+		rawFollowThrough.threshold >= 0 &&
+		rawFollowThrough.threshold <= 1
+	) {
+		followThrough.threshold = rawFollowThrough.threshold;
+	}
+
+	if (isBoolean(rawFollowThrough.includeToolData)) {
+		followThrough.includeToolData = rawFollowThrough.includeToolData;
+	}
+
+	return { followThrough };
+}
+
+function readSettings(path: string): SettingsFile {
 	try {
 		const value: unknown = JSON.parse(readFileSync(path, "utf8"));
-		return isRecord(value) ? value : {};
+
+		return isJsonValue(value) ? parseSettings(value) : {};
 	} catch {
 		return {};
 	}
 }
 
-function readFollowThroughSettings(settings: UnknownRecord): Partial<FollowThroughConfig> {
-	const value = settings.followThrough;
-	if (!isRecord(value)) return {};
-
-	const config: Partial<FollowThroughConfig> = {};
-	if (
-		typeof value.threshold === "number" &&
-		Number.isFinite(value.threshold) &&
-		value.threshold >= 0 &&
-		value.threshold <= 1
-	) {
-		config.threshold = value.threshold;
-	}
-	if (typeof value.includeToolData === "boolean") {
-		config.includeToolData = value.includeToolData;
-	}
-	return config;
-}
-
 function configFromContext(ctx: Pick<ExtensionContext, "cwd" | "isProjectTrusted">): FollowThroughConfig {
 	const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
-	const global = readFollowThroughSettings(readSettings(join(agentDir, "settings.json")));
+	const global = readSettings(join(agentDir, "settings.json")).followThrough ?? {};
+
 	const project = ctx.isProjectTrusted()
-		? readFollowThroughSettings(readSettings(join(ctx.cwd, ".pi", "settings.json")))
+		? readSettings(join(ctx.cwd, ".pi", "settings.json")).followThrough ?? {}
 		: {};
 
 	return {
@@ -90,118 +154,136 @@ function configFromContext(ctx: Pick<ExtensionContext, "cwd" | "isProjectTrusted
 	};
 }
 
-function messageText(message: UnknownRecord): string {
+function textFromContent(content: ContentMessage["content"]): string {
+	if (!Array.isArray(content)) return content;
+
+	return content.map((part) => (part.type === "text" ? part.text : "")).join("\n");
+}
+
+function hasContent(message: AgentMessage): message is ContentMessage {
+	return "content" in message;
+}
+
+function messageText(message: ContentMessage): string {
 	return textFromContent(message.content);
 }
 
-function toolCallsFromMessage(message: UnknownRecord): string[] {
-	if (!Array.isArray(message.content)) return [];
+function toolCallsFromMessage(message: AgentMessage): string[] {
+	if (message.role !== "assistant") return [];
 
 	return message.content
-		.map((part) => {
-			if (!part || typeof part !== "object") return "";
-			const value = part as UnknownRecord;
-			if (value.type !== "toolCall" || typeof value.name !== "string") return "";
+		.flatMap((part) => {
+			if (part.type !== "toolCall") return [];
 			let args = "";
+
 			try {
-				args = JSON.stringify(value.arguments ?? {});
+				args = JSON.stringify(part.arguments ?? {}) ?? "[unserializable arguments]";
 			} catch {
 				args = "[unserializable arguments]";
 			}
-			return `${value.name}(${args})`;
+
+			return [`${part.name}(${args})`];
 		})
-		.filter(Boolean);
 }
 
-function entryText(entry: unknown, includeToolData: boolean): string {
-	if (!entry || typeof entry !== "object") return "";
-	const value = entry as UnknownRecord;
-	const message = value.message as UnknownRecord | undefined;
-	if (!message || typeof message !== "object") return "";
+function entryText(entry: SessionEntry, includeToolData: boolean): string {
+	if (entry.type !== "message" || !hasContent(entry.message)) return "";
 
-	const role = typeof message.role === "string" ? message.role : "message";
+	const message = entry.message;
+	const role = message.role;
 	const text = messageText(message);
+
 	if (role === "assistant" || role === "user" || role === "custom") {
 		return text ? `${role.toUpperCase()}: ${text}` : "";
 	}
+
 	if (role === "toolResult") {
 		if (!includeToolData) return "";
-		const toolName = typeof message.toolName === "string" ? message.toolName : "tool";
+		const toolName = message.toolName;
+
 		return `${role.toUpperCase()} ${toolName}: ${text}`;
 	}
 
-	return text ? `${role.toUpperCase()}: ${text}` : "";
+	return "";
 }
 
-function latestAssistant(messages: unknown): FinalRun | undefined {
-	if (!Array.isArray(messages)) return undefined;
-
+function latestAssistant(messages: AgentEndEvent["messages"]): FinalRun | undefined {
 	for (let index = messages.length - 1; index >= 0; index -= 1) {
 		const message = messages[index];
-		if (!message || typeof message !== "object") continue;
-		const value = message as UnknownRecord;
-		if (value.role !== "assistant") continue;
+
+		if (message.role !== "assistant") continue;
 
 		return {
-			finalOutput: clip(messageText(value), 8_000),
-			stopReason: typeof value.stopReason === "string" ? value.stopReason : undefined,
+			finalOutput: clip(messageText(message), MAX_FIELD_CHARS),
+			stopReason: message.stopReason,
 		};
 	}
 
 	return undefined;
 }
 
-function branchEntries(ctx: ExtensionContext): unknown[] {
+function branchEntries(ctx: ExtensionContext): SessionEntry[] {
 	try {
-		return ctx.sessionManager.getBranch() as unknown[];
+		return ctx.sessionManager.getBranch();
 	} catch {
 		return [];
 	}
 }
 
-function buildState(ctx: ExtensionContext, finalOutput: string, includeToolData: boolean): UnknownRecord {
+function buildState(ctx: ExtensionContext, finalOutput: string, includeToolData: boolean): JevState {
 	const entries = branchEntries(ctx);
 	const lines = entries.map((entry) => entryText(entry, includeToolData)).filter(Boolean);
 	const requests = lines.filter((line) => line.startsWith("USER:")).slice(-8);
-	const state: UnknownRecord = {
+
+	const state: JevState = {
 		task: clip(requests.join("\n\n"), MAX_FIELD_CHARS),
 		recent_transcript: clip(lines.slice(-20).join("\n\n"), MAX_STATE_CHARS),
 		final_output: clip(finalOutput, MAX_FIELD_CHARS),
+		previous_nudge: null,
 	};
+
 	const recentNudges = requests.filter((line) => line.includes(NUDGE_MESSAGE));
 	state.previous_nudge = recentNudges.at(-1) ?? null;
 
 	if (includeToolData) {
 		const toolCalls = entries
-			.map((entry) => {
-				if (!entry || typeof entry !== "object") return [];
-				const message = (entry as UnknownRecord).message;
-				if (!message || typeof message !== "object") return [];
-				return toolCallsFromMessage(message as UnknownRecord);
+			.flatMap((entry) => {
+				return entry.type === "message" ? toolCallsFromMessage(entry.message) : [];
 			})
-			.flat()
 			.slice(-20);
+
 		state.tool_calls = clip(toolCalls.join("\n"), MAX_FIELD_CHARS);
 	}
 
 	return state;
 }
 
-function nudgeProbability(body: unknown): number | undefined {
-	if (!body || typeof body !== "object") return undefined;
-	const answers = (body as UnknownRecord).answers;
-	if (!answers || typeof answers !== "object") return undefined;
-	const answer = (answers as UnknownRecord).should_nudge;
-	if (!answer || typeof answer !== "object") return undefined;
+function isJevResponse(value: unknown): value is JevResponse {
+	if (!isJsonValue(value) || !isJsonObjectValue(value)) return false;
 
-	const value = (answer as UnknownRecord).noul;
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1
-		? value
-		: undefined;
+	const answers = value.answers;
+
+	if (!isJsonObjectValue(answers)) return true;
+
+	const shouldNudge = answers.should_nudge;
+
+	if (!isJsonObjectValue(shouldNudge)) return true;
+
+	const probability = shouldNudge.noul;
+
+	return (
+		probability === undefined ||
+		(isFiniteNumber(probability) && probability >= 0 && probability <= 1)
+	);
 }
 
-async function askJev(state: UnknownRecord): Promise<number | undefined> {
+function nudgeProbability(body: JevResponse): number | undefined {
+	return body.answers?.should_nudge?.noul;
+}
+
+async function askJev(state: JevState): Promise<number | undefined> {
 	const apiKey = process.env.TYPESAFE_API_KEY ?? process.env.TYPESAFE_AI_API_KEY;
+
 	if (!apiKey) return undefined;
 
 	const controller = new AbortController();
@@ -235,20 +317,24 @@ async function askJev(state: UnknownRecord): Promise<number | undefined> {
 
 		if (!response.ok) {
 			console.warn(`[pi-follow-through] TypeSafe returned HTTP ${response.status}; skipping nudge`);
+
 			return undefined;
 		}
 
-		return nudgeProbability(await response.json());
+		const body: unknown = await response.json();
+
+		return isJevResponse(body) ? nudgeProbability(body) : undefined;
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		console.warn(`[pi-follow-through] TypeSafe request failed: ${message}`);
+
 		return undefined;
 	} finally {
 		clearTimeout(timeout);
 	}
 }
 
-export default function followThrough(pi: ExtensionAPI): void {
+export default function followThrough(pi: FollowThroughAPI): void {
 	let runNumber = 0;
 	let finalRun: FinalRun | undefined;
 
