@@ -1,6 +1,6 @@
 {
   "name": "pi-follow-through",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A Pi extension that asks Jev whether useful work remains after a run.",
   "keywords": ["pi-package", "pi", "jev", "typesafe"],
   "license": "MIT",
