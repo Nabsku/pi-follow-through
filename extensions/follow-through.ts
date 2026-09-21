@@ -80,10 +80,12 @@ type JevState = {
 };
 
 type JevNoulAnswer = {
+	type: "noul";
 	noul: number;
 };
 
 type JevChoiceAnswer = {
+	type: "choice";
 	choice: string;
 };
 
@@ -385,14 +387,26 @@ function isJevResponse(value: unknown): value is JevResponse {
 
 	const shouldNudge = answers.should_nudge;
 
-	if (!isJsonObjectValue(shouldNudge) || !isFiniteNumber(shouldNudge.noul)) return false;
+	if (
+		!isJsonObjectValue(shouldNudge) ||
+		shouldNudge.type !== "noul" ||
+		!isFiniteNumber(shouldNudge.noul)
+	) {
+		return false;
+	}
 
 	if (shouldNudge.noul < 0 || shouldNudge.noul > 1) return false;
 
 	for (const key of ["request_evidence", "unfinished_evidence", "work_status"]) {
 		const answer = answers[key];
 
-		if (!isJsonObjectValue(answer) || typeof answer.choice !== "string") return false;
+		if (
+			!isJsonObjectValue(answer) ||
+			answer.type !== "choice" ||
+			typeof answer.choice !== "string"
+		) {
+			return false;
+		}
 	}
 
 	return true;
@@ -450,8 +464,7 @@ async function askJev(state: JevState): Promise<JevDecision | undefined> {
 				questions: {
 					should_nudge: {
 						type: "noul",
-						instructions:
-							"Should the agent be prompted to continue work from the user's outstanding request? Answer true only when an explicit active user request has an unfinished required step that the agent can perform now. If the active request is limited to diagnosis, explanation, review, or instructions, it is complete once that requested result is delivered; do not treat implementation, deployment, publishing, committing, or external-system changes as remaining unless the user explicitly requested that action. When the user did explicitly request implementation, a fix, verification, a commit, deployment, or cleanup, that unfinished action remains in scope. Treat an explicit statement that requested implementation, fix, verification, commit, deployment, or cleanup is not yet done and can be done now as strong evidence for true. Answer false when the requested result has been delivered, the user must provide a decision, permission, credentials, or information, or an external event is required. Statements that an unrequested mutation was not performed are not evidence of unfinished requested work. Do not expand scope or chase optional polish. When there was a previous nudge, answer true only if the latest output shows meaningful new progress or a newly exposed concrete authorized step, not the same promise or blocker.",
+						instructions: "Using `request_candidates` to identify the active request and `final_output` to identify the latest result, should the agent be prompted to continue work from the user's outstanding request? Answer true only when an explicit active user request has an unfinished required step that the agent can perform now. If the active request is limited to diagnosis, explanation, review, or instructions, it is complete once that requested result is delivered; do not treat implementation, deployment, publishing, committing, or external-system changes as remaining unless the user explicitly requested that action. When the user did explicitly request implementation, a fix, verification, a commit, deployment, or cleanup, that unfinished action remains in scope. Treat an explicit statement that requested implementation, fix, verification, commit, deployment, or cleanup is not yet done and can be done now as strong evidence for true. Answer false when the requested result has been delivered, the user must provide a decision, permission, credentials, or information, or an external event is required. Statements that an unrequested mutation was not performed are not evidence of unfinished requested work. Do not expand scope or chase optional polish. When there was a previous nudge, answer true only if the latest output shows meaningful new progress or a newly exposed concrete authorized step, not the same promise or blocker.",
 						criteria: {
 							true: "A short continuation prompt would likely advance an unfinished action the user explicitly requested.",
 							false: "The explicit request is complete, or continuation would require inventing scope, inferring authorization, user input, or an external event.",
@@ -459,8 +472,7 @@ async function askJev(state: JevState): Promise<JevDecision | undefined> {
 					},
 					request_evidence: {
 						type: "choice",
-						instructions:
-							"Which user request is the unfinished work about? Choose none unless one request is clearly still active and in scope.",
+						instructions: "Which request in `request_candidates` is the unfinished work about? Choose none unless one request is clearly still active and in scope.",
 						criteria: choiceCriteria(
 							state.request_candidates,
 							"No user request is clearly still active and in scope.",
@@ -468,8 +480,7 @@ async function askJev(state: JevState): Promise<JevDecision | undefined> {
 					},
 					unfinished_evidence: {
 						type: "choice",
-						instructions:
-							"Which exact line from the final assistant output explicitly shows that requested work remains unfinished and can be advanced now? Choose none if no such line exists.",
+						instructions: "Which exact line in `evidence_candidates` from `final_output` explicitly shows that requested work remains unfinished and can be advanced now? Choose none if no such line exists.",
 						criteria: choiceCriteria(
 							state.evidence_candidates,
 							"The final assistant output contains no explicit evidence of unfinished, authorized work.",
@@ -477,7 +488,7 @@ async function askJev(state: JevState): Promise<JevDecision | undefined> {
 					},
 					work_status: {
 						type: "choice",
-						instructions: "What is the status of the user's requested work in the final assistant output?",
+						instructions: "What is the status of the user's requested work in `final_output`?",
 						criteria: {
 							complete: "The requested work is explicitly complete.",
 							incomplete: "Requested work is explicitly unfinished and can continue now.",

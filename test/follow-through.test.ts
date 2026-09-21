@@ -156,10 +156,10 @@ function jevResponse(
 	return new Response(
 		JSON.stringify({
 			answers: {
-				should_nudge: { noul: probability },
-				request_evidence: { choice: state.request_candidates[0]?.id ?? "none" },
-				unfinished_evidence: { choice: state.evidence_candidates[0]?.id ?? "none" },
-				work_status: { choice: workStatus },
+				should_nudge: { type: "noul", noul: probability },
+				request_evidence: { type: "choice", choice: state.request_candidates[0]?.id ?? "none" },
+				unfinished_evidence: { type: "choice", choice: state.evidence_candidates[0]?.id ?? "none" },
+				work_status: { type: "choice", choice: workStatus },
 			},
 		}),
 		{ status: 200 },
@@ -301,15 +301,17 @@ test("caps request candidate text across the last eight user requests", async ()
 test("keeps follow-up actions within the explicit user request", async () => {
 	const agentDir = await mkdtemp(join(tmpdir(), "pi-follow-through-"));
 	const originalFetch = globalThis.fetch;
-	let instructions = "";
+	let instructions: Record<string, string> = {};
 
 	globalThis.fetch = async (_input, init) => {
 		// SAFETY: The extension under test serializes this request with the asserted question shape.
 		const request = JSON.parse(String(init?.body)) as RequestBody & {
-			questions: { should_nudge: { instructions: string } };
+			questions: Record<string, { instructions: string }>;
 		};
 
-		instructions = request.questions.should_nudge.instructions;
+		instructions = Object.fromEntries(
+			Object.entries(request.questions).map(([id, question]) => [id, question.instructions]),
+		);
 
 		return jevResponse(request.state);
 	};
@@ -330,9 +332,17 @@ test("keeps follow-up actions within the explicit user request", async () => {
 			},
 		);
 
-		assert.match(instructions, /limited to diagnosis, explanation, review, or instructions/);
-		assert.match(instructions, /unless the user explicitly requested that action/);
-		assert.match(instructions, /requested implementation, fix, verification, commit, deployment, or cleanup is not yet done/);
+		assert.match(instructions.should_nudge ?? "", /limited to diagnosis, explanation, review, or instructions/);
+		assert.match(instructions.should_nudge ?? "", /unless the user explicitly requested that action/);
+		assert.match(
+			instructions.should_nudge ?? "",
+			/requested implementation, fix, verification, commit, deployment, or cleanup is not yet done/,
+		);
+		assert.match(instructions.should_nudge ?? "", /`request_candidates`/);
+		assert.match(instructions.should_nudge ?? "", /`final_output`/);
+		assert.match(instructions.request_evidence ?? "", /`request_candidates`/);
+		assert.match(instructions.unfinished_evidence ?? "", /`evidence_candidates`/);
+		assert.match(instructions.work_status ?? "", /`final_output`/);
 	} finally {
 		globalThis.fetch = originalFetch;
 		await rm(agentDir, { recursive: true, force: true });
@@ -434,6 +444,50 @@ test("rejects citations that are not present in the current state", async () => 
 		};
 
 		body.answers.request_evidence.choice = "request_missing";
+
+		return new Response(JSON.stringify(body), { status: 200 });
+	};
+
+	try {
+		await withEnv(
+			{ PI_CODING_AGENT_DIR: agentDir, TYPESAFE_API_KEY: "test-key", TYPESAFE_AI_API_KEY: undefined },
+			async () => {
+				const pi = createPi();
+				install(pi);
+				await settle(
+					pi,
+					createContext(agentDir, branch),
+					"The implementation remains incomplete; I can finish it now.",
+				);
+				assert.deepEqual(pi.sentMessages, []);
+			},
+		);
+	} finally {
+		globalThis.fetch = originalFetch;
+		await rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("rejects answers whose declared types do not match their questions", async () => {
+	const agentDir = await mkdtemp(join(tmpdir(), "pi-follow-through-"));
+
+	const branch: TestEntry[] = [
+		{ type: "message", message: { role: "user", content: "Finish the implementation." } },
+	];
+
+	const originalFetch = globalThis.fetch;
+
+	globalThis.fetch = async (_input, init) => {
+		// SAFETY: The extension under test serializes this request with the RequestBody shape.
+		const request = JSON.parse(String(init?.body)) as RequestBody;
+		const response = jevResponse(request.state);
+
+		// SAFETY: The fixture was created by jevResponse and contains the field below.
+		const body = (await response.json()) as {
+			answers: { should_nudge: { type: string } };
+		};
+
+		body.answers.should_nudge.type = "choice";
 
 		return new Response(JSON.stringify(body), { status: 200 });
 	};
