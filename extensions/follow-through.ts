@@ -22,6 +22,8 @@ const MAX_FIELD_CHARS = 8_000;
 // TypeSafe Choice supports 255 options; reserve one option for "none".
 const MAX_CHOICE_CANDIDATES = 254;
 
+const TRUNCATION_MARKER = "\n[truncated]";
+
 const NUDGE_MESSAGE =
 	"Continue useful work that is still within the user's request. Check for unfinished requested work and complete it now; do not invent follow-up work. If the request is complete, or progress needs user input, permission, or an external event, stop and say so.";
 
@@ -99,7 +101,9 @@ type JevDecision = {
 };
 
 function clip(value: string, maxChars: number): string {
-	return value.length <= maxChars ? value : `${value.slice(0, maxChars)}\n[truncated]`;
+	return value.length <= maxChars
+		? value
+		: `${value.slice(0, maxChars - TRUNCATION_MARKER.length)}${TRUNCATION_MARKER}`;
 }
 
 function isJsonObject(value: unknown): value is JsonObject {
@@ -255,18 +259,20 @@ function toolCallsFromMessage(message: AgentMessage): string[] {
 }
 
 function requestCandidates(lines: string[]): StateCandidate[] {
-	const candidates: StateCandidate[] = [];
-
-	for (const line of lines
+	const requests = lines
 		.filter((value) => value.startsWith("USER:") && !value.includes(NUDGE_MESSAGE))
-		.slice(-8)) {
-		candidates.push({
-			id: `request_${candidates.length}`,
-			text: line.slice("USER: ".length),
-		});
-	}
+		.slice(-8)
+		.map((line) => line.slice("USER: ".length));
 
-	return candidates;
+	let remainingChars = MAX_FIELD_CHARS;
+
+	return requests.map((text, index) => {
+		const maxChars = Math.floor(remainingChars / (requests.length - index));
+		const clipped = clip(text, maxChars);
+		remainingChars -= clipped.length;
+
+		return { id: `request_${index}`, text: clipped };
+	});
 }
 
 function evidenceCandidates(finalOutput: string): StateCandidate[] {

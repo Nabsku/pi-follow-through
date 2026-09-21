@@ -258,6 +258,46 @@ test("uses trusted project settings and omits tool data when configured", async 
 	}
 });
 
+test("caps request candidate text across the last eight user requests", async () => {
+	const agentDir = await mkdtemp(join(tmpdir(), "pi-follow-through-"));
+
+	const branch: TestEntry[] = Array.from({ length: 8 }, (_, index) => ({
+		type: "message",
+		message: { role: "user", content: `request ${index}: ${"x".repeat(10_000)}` },
+	}));
+
+	const originalFetch = globalThis.fetch;
+	let request: RequestBody | undefined;
+	globalThis.fetch = async (_input, init) => {
+		// SAFETY: The extension under test serializes this request with the RequestBody shape.
+		request = JSON.parse(String(init?.body)) as RequestBody;
+
+		return jevResponse(request.state);
+	};
+
+	try {
+		await withEnv(
+			{ PI_CODING_AGENT_DIR: agentDir, TYPESAFE_API_KEY: "test-key", TYPESAFE_AI_API_KEY: undefined },
+			async () => {
+				const pi = createPi();
+				install(pi);
+				await settle(pi, createContext(agentDir, branch), "Implementation remains incomplete.");
+			},
+		);
+
+		assert.ok(request);
+		assert.equal(request.state.request_candidates.length, 8);
+		assert.ok(
+			request.state.request_candidates.reduce((total, candidate) => total + candidate.text.length, 0) <= 8_000,
+		);
+		assert.match(request.state.request_candidates.at(-1)?.text ?? "", /^request 7:/);
+		assert.match(request.state.request_candidates.at(-1)?.text ?? "", /\[truncated\]$/);
+	} finally {
+		globalThis.fetch = originalFetch;
+		await rm(agentDir, { recursive: true, force: true });
+	}
+});
+
 test("nudges only when Jev cites current request evidence", async () => {
 	const agentDir = await mkdtemp(join(tmpdir(), "pi-follow-through-"));
 
