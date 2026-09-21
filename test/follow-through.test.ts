@@ -298,6 +298,47 @@ test("caps request candidate text across the last eight user requests", async ()
 	}
 });
 
+test("keeps follow-up actions within the explicit user request", async () => {
+	const agentDir = await mkdtemp(join(tmpdir(), "pi-follow-through-"));
+	const originalFetch = globalThis.fetch;
+	let instructions = "";
+
+	globalThis.fetch = async (_input, init) => {
+		// SAFETY: The extension under test serializes this request with the asserted question shape.
+		const request = JSON.parse(String(init?.body)) as RequestBody & {
+			questions: { should_nudge: { instructions: string } };
+		};
+
+		instructions = request.questions.should_nudge.instructions;
+
+		return jevResponse(request.state);
+	};
+
+	try {
+		await withEnv(
+			{ PI_CODING_AGENT_DIR: agentDir, TYPESAFE_API_KEY: "test-key", TYPESAFE_AI_API_KEY: undefined },
+			async () => {
+				const pi = createPi();
+				install(pi);
+				await settle(
+					pi,
+					createContext(agentDir, [
+						{ type: "message", message: { role: "user", content: "Figure out why deployment failed." } },
+					]),
+					"The failure is caused by missing credentials. I did not deploy a fix.",
+				);
+			},
+		);
+
+		assert.match(instructions, /limited to diagnosis, explanation, review, or instructions/);
+		assert.match(instructions, /unless the user explicitly requested that action/);
+		assert.match(instructions, /requested implementation, fix, verification, commit, deployment, or cleanup is not yet done/);
+	} finally {
+		globalThis.fetch = originalFetch;
+		await rm(agentDir, { recursive: true, force: true });
+	}
+});
+
 test("nudges only when Jev cites current request evidence", async () => {
 	const agentDir = await mkdtemp(join(tmpdir(), "pi-follow-through-"));
 
