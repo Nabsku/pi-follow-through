@@ -7,11 +7,11 @@ An agent can finish the immediate step that produced its last answer and still l
 ## Event flow
 
 1. Pi emits `agent_end` when a low-level run ends. The extension keeps the last assistant message from that run.
-2. Pi emits `agent_settled` after retries, compaction, and queued continuations are finished.
+2. Pi emits `agent_settled` after retries, compaction, and queued continuations are finished. The extension also skips runs whose `subagent` tool result reports an async workflow still running.
 3. The extension builds a small state object from the active session branch.
 4. It asks Jev for a `noul` probability plus three `choice` answers: the active user request, an exact unfinished-evidence candidate, and the work status.
 5. The extension validates that the selected request and evidence IDs exist in the submitted state, that the status is `incomplete`, and that the state contains a final-output evidence candidate.
-6. If the probability reaches the configured threshold (default `0.80`), the progress differs from the last nudge, and the session is still idle, it sends the continuation message.
+6. If the probability reaches the configured threshold (default `0.80`), the progress differs from the last nudge, no delegated workflow is pending, and the session is still idle, it sends the continuation message.
 
 The second idle check matters. A user may submit another request while Jev is evaluating the previous answer. In that case the old evaluation must not inject a message into the new run.
 

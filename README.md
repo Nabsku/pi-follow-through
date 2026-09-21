@@ -52,7 +52,7 @@ Continue useful work that is still within the user's request. Check for unfinish
 
 The evaluator prompt treats short confirmations such as "Yes" and "Continue" as part of the earlier request. It also treats an explicit statement that implementation or review remains incomplete as evidence of unfinished work. A previous nudge is not enough on its own. The latest response must show new, actionable progress or a concrete next step.
 
-The extension only sends nudges in TUI and RPC modes. It skips print and JSON modes, failed or aborted runs, and stale evaluator responses after a new run starts. A missing key, request error, or two-second timeout skips the nudge instead of interrupting Pi.
+The extension only sends nudges in TUI and RPC modes. It skips print and JSON modes, failed or aborted runs, active async subagent workflows, and stale evaluator responses after a new run starts. A missing key, request error, or two-second timeout skips the nudge instead of interrupting Pi.
 
 ## Data sent to TypeSafe
 

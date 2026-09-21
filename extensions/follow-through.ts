@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { AgentEndEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentEndEvent, ExtensionAPI, ExtensionContext, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 
 const JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 
@@ -129,6 +129,49 @@ function isBoolean(value: JsonValue | undefined): value is boolean {
 
 function isFiniteNumber(value: JsonValue | undefined): value is number {
 	return typeof value === "number" && Number.isFinite(value);
+}
+
+type DelegatedWorkState = "running" | "settled" | undefined;
+
+function stateFromText(value: string): DelegatedWorkState {
+	const match = /\bstate\s*:\s*(running|complete|completed|failed|cancelled|canceled|stopped)\b/i.exec(value);
+
+	if (match) return match[1].toLowerCase() === "running" ? "running" : "settled";
+
+	return /\basync\s+(?:workflow|run)\b[\s\S]*\brunning\b/i.test(value) ? "running" : undefined;
+}
+
+function stateFromDetails(value: JsonValue | undefined): DelegatedWorkState {
+	if (!isJsonObjectValue(value)) return undefined;
+
+	for (const key of ["workflowState", "state"]) {
+		const state = value[key];
+
+		if (state === "running") return "running";
+
+		if (
+			state === "complete" ||
+			state === "completed" ||
+			state === "failed" ||
+			state === "cancelled" ||
+			state === "canceled" ||
+			state === "stopped"
+		) {
+			return "settled";
+		}
+	}
+
+	return stateFromDetails(value.workflowChildren);
+}
+
+function delegatedWorkState(event: ToolResultEvent): DelegatedWorkState {
+	if (event.toolName !== "subagent" || event.isError) return undefined;
+
+	const content = event.content.map((part) => (part.type === "text" ? part.text : "")).join("\n");
+
+	const details = isJsonValue(event.details) ? event.details : undefined;
+
+	return stateFromText(content) ?? stateFromDetails(details);
 }
 
 function parseSettings(value: JsonValue): SettingsFile {
@@ -464,16 +507,36 @@ export default function followThrough(pi: FollowThroughAPI): void {
 	let runNumber = 0;
 	let finalRun: FinalRun | undefined;
 	let lastNudgedProgress: string | undefined;
+	let delegatedWorkPending = false;
 
 	pi.on("session_start", () => {
 		runNumber += 1;
 		finalRun = undefined;
 		lastNudgedProgress = undefined;
+		delegatedWorkPending = false;
 	});
 
 	pi.on("agent_start", () => {
 		runNumber += 1;
 		finalRun = undefined;
+		// The marker belongs to the preceding parent run; this run can mark it again.
+		delegatedWorkPending = false;
+	});
+
+	pi.on("session_shutdown", () => {
+		delegatedWorkPending = false;
+	});
+
+	pi.on("session_tree", () => {
+		delegatedWorkPending = false;
+	});
+
+	pi.on("tool_result", (event) => {
+		const state = delegatedWorkState(event);
+
+		if (state === "running") delegatedWorkPending = true;
+
+		if (state === "settled") delegatedWorkPending = false;
 	});
 
 	pi.on("agent_end", (event) => {
@@ -485,7 +548,8 @@ export default function followThrough(pi: FollowThroughAPI): void {
 			(ctx.mode !== "tui" && ctx.mode !== "rpc") ||
 			!finalRun ||
 			finalRun.stopReason === "error" ||
-			finalRun.stopReason === "aborted"
+			finalRun.stopReason === "aborted" ||
+			delegatedWorkPending
 		) {
 			return;
 		}
@@ -498,6 +562,7 @@ export default function followThrough(pi: FollowThroughAPI): void {
 				decision === undefined ||
 				decision.probability < config.threshold ||
 				settledRun !== runNumber ||
+				delegatedWorkPending ||
 				!ctx.isIdle() ||
 				lastNudgedProgress === progressFingerprint(state)
 			) {

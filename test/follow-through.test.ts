@@ -376,3 +376,71 @@ test("rejects citations that are not present in the current state", async () => 
 		await rm(agentDir, { recursive: true, force: true });
 	}
 });
+
+test("does not nudge while an async subagent workflow is running", async () => {
+	const agentDir = await mkdtemp(join(tmpdir(), "pi-follow-through-"));
+
+	const branch: TestEntry[] = [
+		{ type: "message", message: { role: "user", content: "Finish the implementation." } },
+	];
+
+	const originalFetch = globalThis.fetch;
+	let fetchCalls = 0;
+	globalThis.fetch = async (_input, init) => {
+		fetchCalls += 1;
+
+		// SAFETY: The extension under test serializes a request with this exact body shape.
+		const request = JSON.parse(String(init?.body)) as RequestBody;
+
+		return jevResponse(request.state);
+	};
+
+	try {
+		await withEnv(
+			{ PI_CODING_AGENT_DIR: agentDir, TYPESAFE_API_KEY: "test-key", TYPESAFE_AI_API_KEY: undefined },
+			async () => {
+				const pi = createPi();
+				const ctx = createContext(agentDir, branch);
+				install(pi);
+
+				await emit(pi, "session_start", {});
+				await emit(pi, "agent_start", {});
+				await emit(
+					pi,
+					"tool_result",
+					{
+						type: "tool_result",
+						toolCallId: "subagent-call",
+						toolName: "subagent",
+						input: {},
+						content: [{ type: "text", text: "Async workflow [workflow-id]\n\nThe async run is detached and running in the background." }],
+						isError: false,
+						details: { workflowChildren: { workflowState: "running" } },
+					},
+					ctx,
+				);
+				await emit(pi, "agent_end", {
+					messages: [{ role: "assistant", content: "The implementation remains incomplete; I can finish it now." }],
+				});
+				await emit(pi, "agent_settled", {}, ctx);
+				await new Promise<void>((resolve) => setImmediate(resolve));
+
+				assert.deepEqual(pi.sentMessages, []);
+				assert.equal(fetchCalls, 0);
+
+				await emit(pi, "agent_start", {});
+				await emit(pi, "agent_end", {
+					messages: [{ role: "assistant", content: "The implementation remains incomplete; continue now." }],
+				});
+				await emit(pi, "agent_settled", {}, ctx);
+				await new Promise<void>((resolve) => setImmediate(resolve));
+
+				assert.equal(pi.sentMessages.length, 1);
+				assert.equal(fetchCalls, 1);
+			},
+		);
+	} finally {
+		globalThis.fetch = originalFetch;
+		await rm(agentDir, { recursive: true, force: true });
+	}
+});
