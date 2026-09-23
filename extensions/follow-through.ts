@@ -536,8 +536,6 @@ export default function followThrough(pi: FollowThroughAPI): void {
 	pi.on("agent_start", () => {
 		runNumber += 1;
 		finalRun = undefined;
-		// The marker belongs to the preceding parent run; this run can mark it again.
-		delegatedWorkPending = false;
 	});
 
 	pi.on("session_shutdown", () => {

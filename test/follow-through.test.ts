@@ -570,6 +570,30 @@ test("does not nudge while an async subagent workflow is running", async () => {
 				await emit(pi, "agent_settled", {}, ctx);
 				await new Promise<void>((resolve) => setImmediate(resolve));
 
+				assert.deepEqual(pi.sentMessages, []);
+				assert.equal(fetchCalls, 0);
+
+				await emit(
+					pi,
+					"tool_result",
+					{
+						type: "tool_result",
+						toolCallId: "subagent-call-complete",
+						toolName: "subagent",
+						input: {},
+						content: [{ type: "text", text: "Async workflow [workflow-id] completed." }],
+						isError: false,
+						details: { workflowChildren: { workflowState: "completed" } },
+					},
+					ctx,
+				);
+				await emit(pi, "agent_start", {});
+				await emit(pi, "agent_end", {
+					messages: [{ role: "assistant", content: "The implementation remains incomplete; continue now." }],
+				});
+				await emit(pi, "agent_settled", {}, ctx);
+				await new Promise<void>((resolve) => setImmediate(resolve));
+
 				assert.equal(pi.sentMessages.length, 1);
 				assert.equal(fetchCalls, 1);
 			},
