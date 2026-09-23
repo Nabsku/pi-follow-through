@@ -171,7 +171,7 @@ function stateFromDetails(value: JsonValue | undefined): DelegatedWorkState {
 }
 
 function delegatedWorkState(event: ToolResultEvent): DelegatedWorkState {
-	if (event.toolName !== "subagent" || event.isError) return undefined;
+	if (event.toolName !== "subagent") return undefined;
 
 	const content = event.content.map((part) => (part.type === "text" ? part.text : "")).join("\n");
 
@@ -536,8 +536,6 @@ export default function followThrough(pi: FollowThroughAPI): void {
 	pi.on("agent_start", () => {
 		runNumber += 1;
 		finalRun = undefined;
-		// The marker belongs to the preceding parent run; this run can mark it again.
-		delegatedWorkPending = false;
 	});
 
 	pi.on("session_shutdown", () => {
