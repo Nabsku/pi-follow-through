@@ -581,9 +581,9 @@ test("does not nudge while an async subagent workflow is running", async () => {
 						toolCallId: "subagent-call-complete",
 						toolName: "subagent",
 						input: {},
-						content: [{ type: "text", text: "Async workflow [workflow-id] completed." }],
-						isError: false,
-						details: { workflowChildren: { workflowState: "completed" } },
+						content: [{ type: "text", text: "Workflow failed: [workflow-id]." }],
+						isError: true,
+						details: { workflowChildren: { workflowState: "failed" } },
 					},
 					ctx,
 				);

@@ -171,7 +171,7 @@ function stateFromDetails(value: JsonValue | undefined): DelegatedWorkState {
 }
 
 function delegatedWorkState(event: ToolResultEvent): DelegatedWorkState {
-	if (event.toolName !== "subagent" || event.isError) return undefined;
+	if (event.toolName !== "subagent") return undefined;
 
 	const content = event.content.map((part) => (part.type === "text" ? part.text : "")).join("\n");
 
