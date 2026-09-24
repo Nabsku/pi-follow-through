@@ -34,6 +34,7 @@ type TestContext = {
 	isProjectTrusted(): boolean;
 	isIdle(): boolean;
 	sessionManager: { getBranch(): TestEntry[] };
+	modelRegistry?: TestModelRegistry;
 };
 
 type SettingsFixture = {
@@ -60,6 +61,33 @@ type RequestState = {
 
 type RequestBody = {
 	state: RequestState;
+};
+
+type ClassifierTestContext = {
+	state: RequestState;
+	questions: Record<string, { type: string }>;
+};
+
+type ClassifierTestProvider = {
+	getAllModels(): { type: "classifier"; id: string }[];
+	classify(
+		model: { type: "classifier"; id: string },
+		context: ClassifierTestContext,
+		options?: { apiKey?: string; maxRetries?: number },
+	): Promise<{
+		stopReason: "stop" | "error" | "aborted";
+		answers: {
+			should_nudge: { type: "bool"; probability: number };
+			request_evidence: { type: "choice"; choice: string };
+			unfinished_evidence: { type: "choice"; choice: string };
+			work_status: { type: "choice"; choice: string };
+		};
+	}>;
+};
+
+type TestModelRegistry = {
+	getProvider(provider: string): ClassifierTestProvider | undefined;
+	getApiKeyForProvider(provider: string): Promise<string | undefined>;
 };
 
 type UserMessage = Parameters<ExtensionAPI["sendUserMessage"]>[0];
@@ -188,6 +216,72 @@ test("does not call TypeSafe or nudge without an API key", async () => {
 				await settle(pi, createContext(agentDir, []));
 				assert.equal(fetchCalls, 0);
 				assert.deepEqual(pi.sentMessages, []);
+			},
+		);
+	} finally {
+		globalThis.fetch = originalFetch;
+		await rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("uses Pi's classifier provider when available", async () => {
+	const agentDir = await mkdtemp(join(tmpdir(), "pi-follow-through-"));
+	const originalFetch = globalThis.fetch;
+	let fetchCalls = 0;
+	let classifyCalls = 0;
+
+	globalThis.fetch = async () => {
+		fetchCalls += 1;
+		throw new Error("the Pi classifier provider should handle this request");
+	};
+
+	try {
+		await withEnv(
+			{ PI_CODING_AGENT_DIR: agentDir, TYPESAFE_API_KEY: "legacy-key", TYPESAFE_AI_API_KEY: undefined },
+			async () => {
+				const pi = createPi();
+
+				const ctx = createContext(agentDir, [
+					{ type: "message", message: { role: "user", content: "Finish the implementation." } },
+				]);
+
+				const classifierProvider: ClassifierTestProvider = {
+					getAllModels: () => [{ type: "classifier", id: "jev-latest" }],
+					classify: async (model, context, options) => {
+						classifyCalls += 1;
+						assert.deepEqual(model, { type: "classifier", id: "jev-latest" });
+						assert.equal(context.questions.should_nudge?.type, "bool");
+						assert.equal(options?.apiKey, "test-key");
+						assert.equal(options?.maxRetries, 0);
+
+						return {
+							stopReason: "stop",
+							answers: {
+								should_nudge: { type: "bool", probability: 0.9 },
+								request_evidence: {
+									type: "choice",
+									choice: context.state.request_candidates[0]?.id ?? "none",
+								},
+								unfinished_evidence: {
+									type: "choice",
+									choice: context.state.evidence_candidates[0]?.id ?? "none",
+								},
+								work_status: { type: "choice", choice: "incomplete" },
+							},
+						};
+					},
+				};
+
+				ctx.modelRegistry = {
+					getProvider: (provider) => (provider === "typesafe" ? classifierProvider : undefined),
+					getApiKeyForProvider: async (provider) => (provider === "typesafe" ? "test-key" : undefined),
+				};
+				install(pi);
+				await settle(pi, ctx, "The implementation remains incomplete; I can finish it now.");
+
+				assert.equal(classifyCalls, 1);
+				assert.equal(fetchCalls, 0);
+				assert.equal(pi.sentMessages.length, 1);
 			},
 		);
 	} finally {
