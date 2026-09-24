@@ -7,6 +7,8 @@ const JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 
 const JEV_MODEL = "jev-latest";
 
+const JEV_PROVIDER = "typesafe";
+
 const DEFAULT_THRESHOLD = 0.8;
 
 const DEFAULT_INCLUDE_TOOL_DATA = true;
@@ -79,6 +81,49 @@ type JevState = {
 	tool_calls?: string;
 };
 
+type PiClassifierModel = {
+	type: "classifier";
+	id: string;
+};
+
+type PiClassifierContext = {
+	state: JevState;
+	questions: Record<string, JsonObject>;
+};
+
+type PiClassifierResult = {
+	stopReason: "stop" | "error" | "aborted";
+	answers: Record<string, JsonObject>;
+	errorMessage?: string;
+};
+
+type PiClassifierOptions = {
+	apiKey: string;
+	signal: AbortSignal;
+	maxRetries: number;
+};
+
+type PiClassifierProvider = {
+	getAllModels?: () => readonly PiClassifierModel[];
+	classify?: (
+		model: PiClassifierModel,
+		context: PiClassifierContext,
+		options: PiClassifierOptions,
+	) => Promise<PiClassifierResult>;
+};
+
+type PiModelRegistry = {
+	getProvider(provider: string): PiClassifierProvider | undefined;
+	getApiKeyForProvider(provider: string): Promise<string | undefined>;
+};
+
+type JevQuestions = {
+	should_nudge: JsonObject;
+	request_evidence: JsonObject;
+	unfinished_evidence: JsonObject;
+	work_status: JsonObject;
+};
+
 type JevNoulAnswer = {
 	type: "noul";
 	noul: number;
@@ -131,6 +176,10 @@ function isJsonObjectValue(value: JsonValue | undefined): value is JsonObject {
 
 function isBoolean(value: JsonValue | undefined): value is boolean {
 	return typeof value === "boolean";
+}
+
+function isString(value: JsonValue | undefined): value is string {
+	return typeof value === "string";
 }
 
 function isFiniteNumber(value: JsonValue | undefined): value is number {
@@ -434,6 +483,83 @@ function decisionFromResponse(body: JevResponse, state: JevState): JevDecision |
 	};
 }
 
+function jevQuestions(booleanType: "bool" | "noul", state: JevState): JevQuestions {
+	return {
+		should_nudge: {
+			type: booleanType,
+			instructions: "Using `request_candidates` to identify the active request and `final_output` to identify the latest result, should the agent be prompted to continue work from the user's outstanding request? Answer true only when an explicit active user request has an unfinished required step that the agent can perform now. If the active request is limited to diagnosis, explanation, review, or instructions, it is complete once that requested result is delivered; do not treat implementation, deployment, publishing, committing, or external-system changes as remaining unless the user explicitly requested that action. When the user did explicitly request implementation, a fix, verification, a commit, deployment, or cleanup, that unfinished action remains in scope. Treat an explicit statement that requested implementation, fix, verification, commit, deployment, or cleanup is not yet done and can be done now as strong evidence for true. Answer false when the requested result has been delivered, the user must provide a decision, permission, credentials, or information, or an external event is required. Statements that an unrequested mutation was not performed are not evidence of unfinished requested work. Do not expand scope or chase optional polish. When there was a previous nudge, answer true only if the latest output shows meaningful new progress or a newly exposed concrete authorized step, not the same promise or blocker.",
+			criteria: {
+				true: "A short continuation prompt would likely advance an unfinished action the user explicitly requested.",
+				false: "The explicit request is complete, or continuation would require inventing scope, inferring authorization, user input, or an external event.",
+			},
+		},
+		request_evidence: {
+			type: "choice",
+			instructions: "Which request in `request_candidates` is the unfinished work about? Choose none unless one request is clearly still active and in scope.",
+			criteria: choiceCriteria(
+				state.request_candidates,
+				"No user request is clearly still active and in scope.",
+			),
+		},
+		unfinished_evidence: {
+			type: "choice",
+			instructions: "Which exact line in `evidence_candidates` from `final_output` explicitly shows that requested work remains unfinished and can be advanced now? Choose none if no such line exists.",
+			criteria: choiceCriteria(
+				state.evidence_candidates,
+				"The final assistant output contains no explicit evidence of unfinished, authorized work.",
+			),
+		},
+		work_status: {
+			type: "choice",
+			instructions: "What is the status of the user's requested work in `final_output`?",
+			criteria: {
+				complete: "The requested work is explicitly complete.",
+				incomplete: "Requested work is explicitly unfinished and can continue now.",
+				blocked: "Progress requires user input, permission, or an external event.",
+				unknown: "The final output does not establish a safe continuation.",
+			},
+		},
+	};
+}
+
+function decisionFromPiClassifierResult(body: PiClassifierResult, state: JevState): JevDecision | undefined {
+	if (body.stopReason !== "stop" || !isJsonObject(body.answers)) return undefined;
+
+	const shouldNudge = body.answers.should_nudge;
+	const requestEvidence = body.answers.request_evidence;
+	const unfinishedEvidence = body.answers.unfinished_evidence;
+	const workStatus = body.answers.work_status;
+
+	if (
+		!isJsonObjectValue(shouldNudge) ||
+		shouldNudge.type !== "bool" ||
+		!isFiniteNumber(shouldNudge.probability) ||
+		shouldNudge.probability < 0 ||
+		shouldNudge.probability > 1 ||
+		!isJsonObjectValue(requestEvidence) ||
+		requestEvidence.type !== "choice" ||
+		!isString(requestEvidence.choice) ||
+		!isJsonObjectValue(unfinishedEvidence) ||
+		unfinishedEvidence.type !== "choice" ||
+		!isString(unfinishedEvidence.choice) ||
+		!isJsonObjectValue(workStatus) ||
+		workStatus.type !== "choice" ||
+		!isString(workStatus.choice)
+	) {
+		return undefined;
+	}
+
+	if (workStatus.choice !== "incomplete") return undefined;
+
+	if (requestEvidence.choice === "none" || unfinishedEvidence.choice === "none") return undefined;
+
+	if (!hasCandidate(state.request_candidates, requestEvidence.choice)) return undefined;
+
+	if (!hasCandidate(state.evidence_candidates, unfinishedEvidence.choice)) return undefined;
+
+	return { probability: shouldNudge.probability };
+}
+
 function progressFingerprint(state: JevState): string {
 	return JSON.stringify({
 		task: state.task,
@@ -442,7 +568,7 @@ function progressFingerprint(state: JevState): string {
 	});
 }
 
-async function askJev(state: JevState): Promise<JevDecision | undefined> {
+async function askJevWithFetch(state: JevState): Promise<JevDecision | undefined> {
 	const apiKey = process.env.TYPESAFE_API_KEY ?? process.env.TYPESAFE_AI_API_KEY;
 
 	if (!apiKey) return undefined;
@@ -461,42 +587,7 @@ async function askJev(state: JevState): Promise<JevDecision | undefined> {
 			body: JSON.stringify({
 				model: JEV_MODEL,
 				state,
-				questions: {
-					should_nudge: {
-						type: "noul",
-						instructions: "Using `request_candidates` to identify the active request and `final_output` to identify the latest result, should the agent be prompted to continue work from the user's outstanding request? Answer true only when an explicit active user request has an unfinished required step that the agent can perform now. If the active request is limited to diagnosis, explanation, review, or instructions, it is complete once that requested result is delivered; do not treat implementation, deployment, publishing, committing, or external-system changes as remaining unless the user explicitly requested that action. When the user did explicitly request implementation, a fix, verification, a commit, deployment, or cleanup, that unfinished action remains in scope. Treat an explicit statement that requested implementation, fix, verification, commit, deployment, or cleanup is not yet done and can be done now as strong evidence for true. Answer false when the requested result has been delivered, the user must provide a decision, permission, credentials, or information, or an external event is required. Statements that an unrequested mutation was not performed are not evidence of unfinished requested work. Do not expand scope or chase optional polish. When there was a previous nudge, answer true only if the latest output shows meaningful new progress or a newly exposed concrete authorized step, not the same promise or blocker.",
-						criteria: {
-							true: "A short continuation prompt would likely advance an unfinished action the user explicitly requested.",
-							false: "The explicit request is complete, or continuation would require inventing scope, inferring authorization, user input, or an external event.",
-						},
-					},
-					request_evidence: {
-						type: "choice",
-						instructions: "Which request in `request_candidates` is the unfinished work about? Choose none unless one request is clearly still active and in scope.",
-						criteria: choiceCriteria(
-							state.request_candidates,
-							"No user request is clearly still active and in scope.",
-						),
-					},
-					unfinished_evidence: {
-						type: "choice",
-						instructions: "Which exact line in `evidence_candidates` from `final_output` explicitly shows that requested work remains unfinished and can be advanced now? Choose none if no such line exists.",
-						criteria: choiceCriteria(
-							state.evidence_candidates,
-							"The final assistant output contains no explicit evidence of unfinished, authorized work.",
-						),
-					},
-					work_status: {
-						type: "choice",
-						instructions: "What is the status of the user's requested work in `final_output`?",
-						criteria: {
-							complete: "The requested work is explicitly complete.",
-							incomplete: "Requested work is explicitly unfinished and can continue now.",
-							blocked: "Progress requires user input, permission, or an external event.",
-							unknown: "The final output does not establish a safe continuation.",
-						},
-					},
-				},
+				questions: jevQuestions("noul", state),
 			}),
 			signal: controller.signal,
 		});
@@ -518,6 +609,77 @@ async function askJev(state: JevState): Promise<JevDecision | undefined> {
 	} finally {
 		clearTimeout(timeout);
 	}
+}
+
+async function askJevWithPi(
+	ctx: ExtensionContext,
+	state: JevState,
+): Promise<{ supported: true; decision?: JevDecision } | undefined> {
+	// SAFETY: `modelRegistry` is a public extension-context field in newer Pi releases;
+	// the optional cast keeps this extension compatible with older peer versions.
+	const modelRegistry = (ctx as ExtensionContext & { modelRegistry?: PiModelRegistry }).modelRegistry;
+	const provider = modelRegistry?.getProvider(JEV_PROVIDER);
+
+	if (!provider?.getAllModels || !provider.classify || !modelRegistry?.getApiKeyForProvider) return undefined;
+
+	let model: PiClassifierModel | undefined;
+
+	try {
+		model = provider
+			.getAllModels()
+			.find((candidate) => candidate.type === "classifier" && candidate.id === JEV_MODEL);
+	} catch {
+		return undefined;
+	}
+
+	if (!model) return undefined;
+
+	let apiKey: string | undefined;
+
+	try {
+		apiKey = await modelRegistry.getApiKeyForProvider(JEV_PROVIDER);
+	} catch {
+		return undefined;
+	}
+
+	if (!apiKey) return undefined;
+
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+	timeout.unref?.();
+
+	try {
+		const result = await provider.classify(
+			model,
+			{ state, questions: jevQuestions("bool", state) },
+			{
+				apiKey,
+				signal: controller.signal,
+				maxRetries: 0,
+			},
+		);
+
+		if (result.stopReason === "error" && result.errorMessage) {
+			console.warn(`[pi-follow-through] Pi TypeSafe classifier failed: ${result.errorMessage}`);
+		}
+
+		return { supported: true, decision: decisionFromPiClassifierResult(result, state) };
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.warn(`[pi-follow-through] Pi TypeSafe classifier request failed: ${message}`);
+
+		return { supported: true };
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
+async function askJev(ctx: ExtensionContext, state: JevState): Promise<JevDecision | undefined> {
+	const piAttempt = await askJevWithPi(ctx, state);
+
+	if (piAttempt?.supported) return piAttempt.decision;
+
+	return askJevWithFetch(state);
 }
 
 export default function followThrough(pi: FollowThroughAPI): void {
@@ -572,7 +734,7 @@ export default function followThrough(pi: FollowThroughAPI): void {
 		const settledRun = runNumber;
 		const config = configFromContext(ctx);
 		const state = buildState(ctx, finalRun.finalOutput, config.includeToolData);
-		void askJev(state).then((decision) => {
+		void askJev(ctx, state).then((decision) => {
 			if (
 				decision === undefined ||
 				decision.probability < config.threshold ||
